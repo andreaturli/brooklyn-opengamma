@@ -1,7 +1,12 @@
 package io.cloudsoft.opengamma.server;
 
+import static java.lang.String.format;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
+import brooklyn.event.feed.jmx.JmxAttributePollConfig;
+import brooklyn.event.feed.jmx.JmxFeed;
+import com.google.common.base.Predicates;
 import org.jclouds.compute.domain.OsFamily;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -35,6 +40,8 @@ public class OpenGammaServerImpl extends SoftwareProcessImpl implements OpenGamm
     private static final Logger log = LoggerFactory.getLogger(OpenGammaServerImpl.class);
     
     private HttpFeed httpFeed;
+    private volatile JmxFeed jmxFeed;
+   //private JmxObjectNameAdapter jettyStatsHandler;
     private ActiveMQBroker broker;
     private PostgreSqlNode database;
 
@@ -81,46 +88,70 @@ public class OpenGammaServerImpl extends SoftwareProcessImpl implements OpenGamm
                         .onFailureOrException(Functions.constant(false)))
                 .build();
 
+        String jettyHttpConnector = "com.opengamma.jetty:service=HttpConnector";
+        String opengammaViewHandler = "com.opengamma:type=ViewProcessor,name=ViewProcessor main";
+        String opengammaCalcHandler = "com.opengamma:type=CalculationNodes,name=local";
+        String connectorMbeanName = format("Catalina:type=Connector,port=%s", getAttribute(HTTP_PORT));
+
+        jmxFeed = JmxFeed.builder()
+                .entity(this)
+                .period(5000, TimeUnit.MILLISECONDS)
+                .pollAttribute(new JmxAttributePollConfig<Boolean>(SERVICE_UP)
+                        .objectName(jettyHttpConnector)
+                        .attributeName("Running")
+                        .onSuccess(Functions.forPredicate(Predicates.<Object>equalTo("STARTED")))
+                        .setOnFailureOrException(false))
+                .pollAttribute(new JmxAttributePollConfig<Integer>(REQUEST_COUNT)
+                        .objectName(jettyHttpConnector)
+                        .attributeName("Requests"))
+                .pollAttribute(new JmxAttributePollConfig<Integer>(TOTAL_PROCESSING_TIME)
+                        .objectName(jettyHttpConnector)
+                        .attributeName("ConnectionsDurationTotal"))
+                .pollAttribute(new JmxAttributePollConfig<Integer>(MAX_PROCESSING_TIME)
+                        .objectName(connectorMbeanName)
+                        .attributeName("ConnectionsDurationMax"))
+                .pollAttribute(new JmxAttributePollConfig<Integer>(ERROR_COUNT)
+                        .objectName(jettyHttpConnector)
+                        .attributeName("errorCount"))
+                .pollAttribute(new JmxAttributePollConfig<Integer>(VIEW_PROCESSES_COUNT)
+                        .objectName(opengammaViewHandler)
+                        .attributeName("NumberOfViewProcesses"))
+                .pollAttribute(new JmxAttributePollConfig<Integer>(CALC_JOB_COUNT)
+                        .objectName(opengammaCalcHandler)
+                        .attributeName("TotalJobCount"))
+                .pollAttribute(new JmxAttributePollConfig<Integer>(CALC_NODE_COUNT)
+                        .objectName(opengammaCalcHandler)
+                        .attributeName("TotalNodeCount"))
+                .build();
+
+        JavaAppUtils.connectMXBeanSensors(this);
     }
-    
-    @Override
+
+   @Override
     protected void postStart() {
         super.postStart();
         
-            String ogJettyStatsMbeanName = "com.opengamma.jetty:service=HttpConnector";
+        // do all this after service up, to prevent warnings
+        // TODO migrate JMX routines to brooklyn 6 syntax
+             /*
 
-            JmxFeed.builder().entity(this).period(Duration.ONE_SECOND)
-                    .pollAttribute(new JmxAttributePollConfig<Boolean>(SERVICE_UP)
-                            .objectName(ogJettyStatsMbeanName)
-                            .attributeName("Running")
-                            .setOnFailureOrException(false))
-                    .pollAttribute(new JmxAttributePollConfig<Integer>(REQUEST_COUNT)
-                            .objectName(ogJettyStatsMbeanName)
-                            .attributeName("Requests"))
+        Map flags = MutableMap.of("period", 5000);
+        JmxSensorAdapter jmx = sensorRegistry.register(new JmxSensorAdapter(flags));
+
+        JavaAppUtils.connectMXBeanSensors(this, jmx);
+        
+        jettyStatsHandler = jmx.objectName("com.opengamma.jetty:service=HttpConnector");
+        // have to explicitly turn on, see in postStart
+        jettyStatsHandler.attribute("Running").subscribe(SERVICE_UP);
+        jettyStatsHandler.attribute("Requests").subscribe(REQUEST_COUNT);
         // these two from jetty not available from opengamma bean:
 //        jettyStatsHandler.attribute("requestTimeTotal").subscribe(TOTAL_PROCESSING_TIME);
 //        jettyStatsHandler.attribute("responsesBytesTotal").subscribe(BYTES_SENT);
-                    .pollAttribute(new JmxAttributePollConfig<Integer>(TOTAL_PROCESSING_TIME)
-                            .objectName(ogJettyStatsMbeanName)
-                            .attributeName("ConnectionsDurationTotal"))
-                    .pollAttribute(new JmxAttributePollConfig<Integer>(MAX_PROCESSING_TIME)
-                            .objectName(ogJettyStatsMbeanName)
-                            .attributeName("ConnectionsDurationMax"))
-                            
-                    .pollAttribute(new JmxAttributePollConfig<Integer>(VIEW_PROCESSES_COUNT)
-                            .objectName("com.opengamma:type=ViewProcessor,name=ViewProcessor main")
-                            .attributeName("NumberOfViewProcesses"))
-                            
-                    .pollAttribute(new JmxAttributePollConfig<Integer>(CALC_JOB_COUNT)
-                            .objectName("com.opengamma:type=CalculationNodes,name=local")
-                            .attributeName("TotalJobCount"))
-                    .pollAttribute(new JmxAttributePollConfig<Integer>(CALC_NODE_COUNT)
-                            .objectName("com.opengamma:type=CalculationNodes,name=local")
-                            .attributeName("TotalNodeCount"))
-                            
-                    .build();
-            
-        JavaAppUtils.connectMXBeanSensors(this);
+        // these two might be custom OpenGamma
+        jettyStatsHandler.attribute("ConnectionsDurationTotal").subscribe(TOTAL_PROCESSING_TIME);
+        jettyStatsHandler.attribute("ConnectionsDurationMax").subscribe(MAX_PROCESSING_TIME);
+                        */
+        WebAppServiceMethods.connectWebAppServerPolicies(this);
         JavaAppUtils.connectJavaAppServerPolicies(this);
         WebAppServiceMethods.connectWebAppServerPolicies(this);
 
@@ -130,8 +161,36 @@ public class OpenGammaServerImpl extends SoftwareProcessImpl implements OpenGamm
                 PROCESSING_TIME_PER_SECOND_LAST, PROCESSING_TIME_PER_SECOND_IN_WINDOW,
                 WebAppServiceMethods.DEFAULT_WINDOW_DURATION));
 
-        // many of the stats only are available once we explicitly turn them on
-        Object jettyStatsOnResult = new JmxHelper(this).operation(JmxHelper.createObjectName("com.opengamma.jetty:service=HttpConnector"), 
+      /*
+        JmxObjectNameAdapter opengammaViewHandler = jmx.objectName("com.opengamma:type=ViewProcessor,name=ViewProcessor main");
+        opengammaViewHandler.attribute("NumberOfViewProcesses").subscribe(VIEW_PROCESSES_COUNT);
+        
+        JmxObjectNameAdapter opengammaCalcHandler = jmx.objectName("com.opengamma:type=CalculationNodes,name=local");
+        opengammaCalcHandler.attribute("TotalJobCount").subscribe(CALC_JOB_COUNT);
+        opengammaCalcHandler.attribute("TotalNodeCount").subscribe(CALC_NODE_COUNT);
+               */
+        // job count is some temporal measure already
+//        addEnricher(new RollingTimeWindowMeanEnricher<Double>(this,
+//                CALC_JOB_COUNT, CALC_JOB_RATE,
+//                60*1000));
+        
+        // If MBean is unreachable, then mark as service-down
+        // TODO migrate to new syntax
+        /*
+        opengammaViewHandler.reachable().poll(new Function<Boolean,Void>() {
+                @Override public Void apply(Boolean input) {
+                    if (input != null && Boolean.FALSE.equals(input)) {
+                        Boolean prev = setAttribute(SERVICE_UP, false);
+                        if (Boolean.TRUE.equals(prev)) {
+                            LOG.warn("Could not reach {} over JMX, marking service-down", OpenGammaServerImpl.this);
+                        } else {
+                            if (LOG.isDebugEnabled()) LOG.debug("Could not reach {} over JMX, service-up was previously {}", OpenGammaServerImpl.this, prev);
+                        }
+                    }
+                    return null;
+                }});
+        */
+        Object jettyStatsOnResult = new JmxHelper(this).operation(JmxHelper.createObjectName("com.opengamma.jetty:service=HttpConnector"),
                 "setStatsOn", true);
         log.debug("result of setStatsOn for "+this+": "+jettyStatsOnResult);
     }
@@ -140,6 +199,7 @@ public class OpenGammaServerImpl extends SoftwareProcessImpl implements OpenGamm
     protected void disconnectSensors() {
         super.disconnectSensors();
         if (httpFeed != null) httpFeed.stop();
+        if (jmxFeed != null) jmxFeed.stop();
     }
 
     /** HTTP port number for Jetty web service. */
